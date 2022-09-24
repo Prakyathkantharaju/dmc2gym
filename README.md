@@ -5,10 +5,12 @@ A lightweight wrapper around the DeepMind Control Suite that provides the standa
 * Action space normalization bound each action's coordinate into the ```[-1, 1]``` range.
 * Setting ```frame_skip``` argument lets to perform action repeat.
 
+# Changes by prakyath
+- removed the dict obs -> array.
 
 ### Instalation
 ```
-pip install git+git://github.com/denisyarats/dmc2gym.git
+pip install git+https://github.com/prakyathkantharaju/dmc2gym.git
 ```
 
 ### Usage
