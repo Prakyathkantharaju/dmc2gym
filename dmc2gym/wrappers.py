@@ -1,177 +1,142 @@
-from gym import core, spaces
-from dm_control import suite
-from dm_env import specs
+# Taken from
+# https://github.com/denisyarats/dmc2gym
+# and modified to exclude duplicated code.
+# added code for making observation from dict to array, only use in that case do not use for any other things.
+
+import copy
+from typing import OrderedDict
+
+import dm_env
+import gym
 import numpy as np
+from gym import spaces
 
 
-def _spec_to_box(spec, dtype):
-    def extract_min_max(s):
-        assert s.dtype == np.float64 or s.dtype == np.float32
-        dim = np.int(np.prod(s.shape))
-        if type(s) == specs.Array:
-            bound = np.inf * np.ones(dim, dtype=np.float32)
-            return -bound, bound
-        elif type(s) == specs.BoundedArray:
-            zeros = np.zeros(dim, dtype=np.float32)
-            return s.minimum + zeros, s.maximum + zeros
-
-    mins, maxs = [], []
-    for s in spec:
-        mn, mx = extract_min_max(s)
-        mins.append(mn)
-        maxs.append(mx)
-    low = np.concatenate(mins, axis=0).astype(dtype)
-    high = np.concatenate(maxs, axis=0).astype(dtype)
-    assert low.shape == high.shape
-    return spaces.Box(low, high, dtype=dtype)
-
-
-def _flatten_obs(obs):
-    obs_pieces = []
-    for v in obs.values():
-        flat = np.array([v]) if np.isscalar(v) else v.ravel()
-        obs_pieces.append(flat)
-    return np.concatenate(obs_pieces, axis=0)
-
-
-class DMCWrapper(core.Env):
-    def __init__(
-        self,
-        domain_name,
-        task_name,
-        task_kwargs=None,
-        visualize_reward={},
-        from_pixels=False,
-        height=84,
-        width=84,
-        camera_id=0,
-        frame_skip=1,
-        environment_kwargs=None,
-        channels_first=True
-    ):
-        assert 'random' in task_kwargs, 'please specify a seed, for deterministic behaviour'
-        self._from_pixels = from_pixels
-        self._height = height
-        self._width = width
-        self._camera_id = camera_id
-        self._frame_skip = frame_skip
-        self._channels_first = channels_first
-
-        # create task
-        self._env = suite.load(
-            domain_name=domain_name,
-            task_name=task_name,
-            task_kwargs=task_kwargs,
-            visualize_reward=visualize_reward,
-            environment_kwargs=environment_kwargs
-        )
-
-        # true and normalized action spaces
-        self._true_action_space = _spec_to_box([self._env.action_spec()], np.float32)
-        self._norm_action_space = spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=self._true_action_space.shape,
-            dtype=np.float32
-        )
-
-        # create observation space
-        if from_pixels:
-            shape = [3, height, width] if channels_first else [height, width, 3]
-            self._observation_space = spaces.Box(
-                low=0, high=255, shape=shape, dtype=np.uint8
-            )
+def dmc_spec2gym_space(spec):
+    if isinstance(spec, OrderedDict) or isinstance(spec, dict):
+        spec = copy.copy(spec)
+        for k, v in spec.items():
+            spec[k] = dmc_spec2gym_space(v)
+        return spaces.Dict(spec)
+    elif isinstance(spec, dm_env.specs.BoundedArray):
+        low = np.broadcast_to(spec.minimum, spec.shape)
+        high = np.broadcast_to(spec.maximum, spec.shape)
+        return spaces.Box(low=low,
+                          high=high,
+                          shape=spec.shape,
+                          dtype=spec.dtype)
+    elif isinstance(spec, dm_env.specs.Array):
+        if np.issubdtype(spec.dtype, np.integer):
+            low = np.iinfo(spec.dtype).min
+            high = np.iinfo(spec.dtype).max
+        elif np.issubdtype(spec.dtype, np.inexact):
+            low = float('-inf')
+            high = float('inf')
         else:
-            self._observation_space = _spec_to_box(
-                self._env.observation_spec().values(),
-                np.float64
-            )
-            
-        self._state_space = _spec_to_box(
-            self._env.observation_spec().values(),
-            np.float64
-        )
-        
-        self.current_state = None
+            raise ValueError()
 
-        # set seed
-        self.seed(seed=task_kwargs.get('random', 1))
+        return spaces.Box(low=low,
+                          high=high,
+                          shape=spec.shape,
+                          dtype=spec.dtype)
+    else:
+        raise NotImplementedError
+
+
+def dmc_obs2gym_obs(obs):
+    # print(type(obs), obs)
+    if isinstance(obs, OrderedDict) or isinstance(obs, dict):
+        obs = copy.copy(obs)
+        for k, v in obs.items():
+            obs[k] = dmc_obs2gym_obs(v)
+        return obs
+    else:
+        return np.asarray(obs)
+
+def custom_obs(obs):
+    obs_store = []
+    for k,v in obs.items():
+        obs_store += list(v)
+    return np.array(obs_store)
+
+def obs_space_array(spec):
+    obs_len = 0
+    for k, v in spec.items():
+        obs_len += v.shape[0]
+    return spaces.Box(low = -np.inf, high=np.inf, shape=(obs_len,), dtype=v.dtype)
+
+
+
+
+class DMCGYM(gym.core.Env):
+
+    metadata = {"render_modes": ["rgb_array"]}
+
+    def __init__(self, env: dm_env.Environment, obs: str = "Array"):
+        self._env = env
+
+        self.action_space = dmc_spec2gym_space(self._env.action_spec())
+        self._reward_store = []
+
+        if obs == "Array":
+            self.observation_space = obs_space_array(self._env.observation_spec())
+        else:
+            self.observation_space = dmc_spec2gym_space(
+                self._env.observation_spec())
+
+
+        self.viewer = None
+
+    def _get_viewer(self):
+        if self.viewer is None:
+            from gym.envs.mujoco.mujoco_rendering import Viewer
+            self.viewer = Viewer(self._env.physics.model.ptr,
+                                 self._env.physics.data.ptr)
+        return self.viewer
 
     def __getattr__(self, name):
         return getattr(self._env, name)
 
-    def _get_obs(self, time_step):
-        if self._from_pixels:
-            obs = self.render(
-                height=self._height,
-                width=self._width,
-                camera_id=self._camera_id
-            )
-            if self._channels_first:
-                obs = obs.transpose(2, 0, 1).copy()
+    def seed(self, seed: int):
+        if hasattr(self._env, 'random_state'):
+            self._env.random_state.seed(seed)
         else:
-            obs = _flatten_obs(time_step.observation)
-        return obs
+            self._env.task.random.seed(seed)
 
-    def _convert_action(self, action):
-        action = action.astype(np.float64)
-        true_delta = self._true_action_space.high - self._true_action_space.low
-        norm_delta = self._norm_action_space.high - self._norm_action_space.low
-        action = (action - self._norm_action_space.low) / norm_delta
-        action = action * true_delta + self._true_action_space.low
-        action = action.astype(np.float32)
-        return action
+    def step(self, action: np.ndarray):
+        assert self.action_space.contains(action)
 
-    @property
-    def observation_space(self):
-        return self._observation_space
+        time_step = self._env.step(action)
+        reward = time_step.reward or 0
+        done = time_step.last()
+        obs = time_step.observation
+        self._reward_store.append(reward)
 
-    @property
-    def state_space(self):
-        return self._state_space
+        info = {}
+        if done and time_step.discount == 1.0:
+            info['TimeLimit.truncated'] = True
 
-    @property
-    def action_space(self):
-        return self._norm_action_space
-
-    @property
-    def reward_range(self):
-        return 0, self._frame_skip
-
-    def seed(self, seed):
-        self._true_action_space.seed(seed)
-        self._norm_action_space.seed(seed)
-        self._observation_space.seed(seed)
-
-    def step(self, action):
-        assert self._norm_action_space.contains(action)
-        action = self._convert_action(action)
-        assert self._true_action_space.contains(action)
-        reward = 0
-        extra = {'internal_state': self._env.physics.get_state().copy()}
-
-        for _ in range(self._frame_skip):
-            time_step = self._env.step(action)
-            reward += time_step.reward or 0
-            done = time_step.last()
-            if done:
-                break
-        obs = self._get_obs(time_step)
-        self.current_state = _flatten_obs(time_step.observation)
-        extra['discount'] = time_step.discount
-        return obs, reward, done, extra
+        return custom_obs(obs), reward, done, False, info
 
     def reset(self):
         time_step = self._env.reset()
-        self.current_state = _flatten_obs(time_step.observation)
-        obs = self._get_obs(time_step)
-        return obs
+        obs = time_step.observation
+        # print(np.mean(self._reward_store), len(self._reward_store))
+        self._reward_store = []
+        # return dmc_obs2gym_obs(obs), {}
+        return custom_obs(obs), {}
 
-    def render(self, mode='rgb_array', height=None, width=None, camera_id=0):
-        assert mode == 'rgb_array', 'only support rgb_array mode, given %s' % mode
-        height = height or self._height
-        width = width or self._width
-        camera_id = camera_id or self._camera_id
-        return self._env.physics.render(
-            height=height, width=width, camera_id=camera_id
-        )
+    def render(self,
+               mode='rgb_array',
+               height: int = 84,
+               width: int = 84,
+               camera_id: int = 0):
+        assert mode in [
+            'human', 'rgb_array'
+        ], 'only support rgb_array and human mode, given %s' % mode
+        if mode == 'rgb_array':
+            return self._env.physics.render(height=height,
+                                            width=width,
+                                            camera_id=camera_id)
+        elif mode == "human":
+            self._get_viewer().render()
